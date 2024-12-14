@@ -1,0 +1,221 @@
+PEP: XXXX
+Title: Artifact Dependency Graph (ADG) Generation in Python Packaging
+Author: Yash Sancheti <yashsancheti24@gmail.com>
+Discussions-To: https://discuss.python.org/
+Status: Draft
+Type: Standards Track
+Created: 15-Dec-2024
+Python-Version: 3.14
+
+Abstract
+========
+
+This PEP proposes integrating automatic Artifact Dependency Graph (ADG) generation
+into Python's packaging workflow. Specifically, it introduces content-based ADG
+creation during the ``bdist_wheel`` build process managed by ``setuptools``.
+The ADG is a machine-readable JSON file (``ADG.json``) embedded in the final
+wheel file (``.whl``), enumerating all files included in the distribution and their
+cryptographic hashes, plus a list of declared dependencies.
+
+This approach aims to improve software supply chain security and vulnerability
+management by enabling verifiable content-based references to artifacts
+rather than relying solely on extrinsic and mutable metadata. The ADG can be
+consumed by vulnerability scanners, SBOM tools, and future Python infrastructure
+to rapidly identify which distributions contain known-vulnerable components.
+
+Motivation
+==========
+
+Current vulnerability management often relies on extrinsic identifiers (CPE,
+purl, SWID) that depend on naming conventions and mutable metadata. Security
+teams often struggle to quickly identify which specific wheels contain vulnerable
+files when a new CVE emerges.
+
+By integrating ADG generation into the build process:
+
+- Each built wheel will contain a verifiable record (ADG.json) of its contents,
+  including exact file hashes and a dependency map.
+- Security scanners can use this intrinsic reference to match known-bad hashes
+  and instantly identify impacted wheels, improving response times.
+- This fosters greater transparency and trust in the Python software supply chain.
+- ADGs complement and enhance existing SBOM formats, providing intrinsic IDs
+  that can be correlated with external security data.
+
+This approach aligns with modern cybersecurity practices, government directives
+(e.g., Executive Order (EO) 14028), and supply chain security frameworks
+(NIST SSDF).
+
+Specification
+=============
+
+**New ADG Generation Capability:**
+
+1. **Opt-In Configuration:**
+   Developers enable ADG generation via ``pyproject.toml``:
+
+   .. code-block:: toml
+
+      [tool.setuptools.adg]
+      enabled = true
+      output = "ADG.json"
+
+   - ``enabled``: If true, ADG generation occurs at wheel build time.
+   - ``output``: The filename for the generated ADG (default "ADG.json").
+
+   If not enabled, the build process proceeds as before with no ADG generated.
+
+2. **When ADG is Generated:**
+   The ADG is created at the end of the ``bdist_wheel`` command, after all files
+   to be included in the wheel are finalized but before writing the final ``RECORD``
+   file. This ensures all files and dependencies are known and stable.
+
+3. **ADG Contents:**
+   ``ADG.json`` contains:
+   - **name**: The project distribution name
+   - **version**: The distribution version
+   - **build**: A dictionary with:
+     - ``timestamp``: The build time (ISO-8601)
+     - ``environment``: Optional description of the build environment
+   - **files**: A list of objects, each with:
+     - ``path``: File path relative to the wheel root
+     - ``hash``: Cryptographic hash (e.g. ``sha256-...``) of the file content
+   - **dependencies**: A list of normalized dependency strings (PEP 508 compatible)
+
+   Example:
+
+   .. code-block:: json
+
+      {
+        "name": "mypackage",
+        "version": "1.0",
+        "build": {
+          "timestamp": "2025-01-01T12:00:00Z",
+          "environment": "CPython 3.14 on Linux x86_64"
+        },
+        "files": [
+          {"path": "mypackage/__init__.py", "hash": "sha256-abc123..."},
+          {"path": "mypackage/module.py", "hash": "sha256-def456..."}
+        ],
+        "dependencies": [
+          "requests>=2.0,<3.0",
+          "otherlib==1.2.3"
+        ]
+      }
+
+4. **Integration in ``bdist_wheel.py``:**
+
+   In the current `setuptools` codebase, `bdist_wheel.py` is responsible for
+   producing the final wheel artifact. After reviewing the code provided, we will:
+
+   - Hook into the ``bdist_wheel.run()`` method after the wheel build is completed
+     and before finalizing RECORD.
+   - Evaluate all included files (using the already-known distribution files from
+     the build steps).
+   - Compute file hashes (using SHA-256 or another cryptographic hash).
+   - Retrieve dependency lists from the distribution metadata (already available
+     via `dist.py` and `dist.distribution.metadata.install_requires` and
+     `dist.distribution.metadata.extras_require`).
+   - Serialize the ADG to ``ADG.json`` in the ``{project}-{version}.dist-info``
+     directory.
+   - Update RECORD accordingly, ensuring ``ADG.json`` is recorded.
+
+   The logical place for this integration is near where ``WHEEL`` and ``METADATA``
+   files are written (in `bdist_wheel.write_wheelfile` or just before finalizing
+   the wheel in `bdist_wheel.run`). This ensures the ADG sees the final set of files
+   and that all dynamic build steps are complete.
+
+   Example pseudocode (not final):
+
+   .. code-block:: python
+
+      # After wheel is built but before RECORD finalization in bdist_wheel.run()
+      if adg_enabled:
+          dist_info_dir = os.path.join(self.bdist_dir, distinfo_dirname)
+          adg_data = generate_adg_data(self.distribution, archive_root)
+          adg_path = os.path.join(dist_info_dir, output_filename)
+          write_json(adg_path, adg_data)
+          # RECORD will pick up ADG.json on finalize
+
+5. **Determining Dependencies and Hashes:**
+   - Dependencies are obtained from ``distribution.install_requires`` and
+     ``distribution.extras_require`` as per existing logic in `dist.py` where
+     requirements are normalized.
+   - Files are enumerated from the wheel build process (already collected by
+     setuptools commands like `egg_info` and `build_py`).
+   - Each file is read, and a SHA-256 hash is computed (Python's `hashlib.sha256`).
+   - The ADG is then written out as UTF-8 JSON.
+
+6. **Performance Considerations:**
+   - Hashing is fast and only done once per file.
+   - The feature is optional, minimizing impact for users who do not enable ADG.
+   - Future enhancements may support caching or incremental builds if needed.
+
+7. **Interoperability:**
+   - The ADG can be correlated with external SBOM formats.
+   - Tools can parse `ADG.json` to quickly identify vulnerable wheels if they have
+     a known-bad hash database.
+   - This proposal does not alter wheel format standards; it just adds an extra file.
+
+Backwards Compatibility
+=======================
+
+- The ADG generation is opt-in. If disabled, behavior is unchanged.
+- If enabled, it adds an extra file (`ADG.json`) to the `.dist-info` directory.
+- Existing tooling that ignores unknown files in `.dist-info` will remain unaffected.
+
+Security Implications
+=====================
+
+- Embedding file hashes improves trust and traceability.
+- Attackers tampering with wheel contents would need to alter ADG.json and RECORD,
+  which is detectable.
+- Future work may include digital signatures for even greater authenticity.
+
+How To Teach This
+=================
+
+- Document in `setuptools` user guide: a new section on enabling ADG.
+- Show example `pyproject.toml` and how `ADG.json` looks.
+- Tutorials on how security teams can query ADG data for quick vulnerability checks.
+
+Reference Implementation
+========================
+
+A reference implementation will be provided in a fork of `setuptools`:
+
+- Modifications to `setuptools/command/bdist_wheel.py` to:
+  - After `wheel_path` creation, compute file hashes for included files.
+  - Gather dependencies from `dist.py` finalized distribution.
+  - Write `ADG.json` into `dist_info_dir`.
+
+- Add logic to `dist.py` or a utility function to extract and normalize dependency
+  data and project name/version.
+
+- Add tests in `setuptools/tests/test_bdist_wheel.py` verifying `ADG.json` presence,
+  correctness of file hashes, and dependencies recorded.
+
+Rejected Ideas
+==============
+
+- Mandatory ADG generation: decided to keep it opt-in to reduce friction and overhead.
+- Integrating ADG data into `WHEEL` or `METADATA` directly: would complicate existing
+  standards. A separate `ADG.json` file is simpler and modular.
+
+Open Issues
+===========
+
+- Finalizing the exact schema for `ADG.json` to ensure future extensibility.
+- Considering optional digital signatures in `ADG.json` (future PEP).
+
+Acknowledgements
+================
+
+Thanks to the Python Packaging Authority for `setuptools` and the community
+discussions that inspired intrinsic artifact identification. Additional thanks
+to reviewers who provided feedback on the initial drafts.
+
+Copyright
+=========
+
+This document is placed in the public domain or under the CC0-1.0-Universal
+license, whichever is more permissive.
